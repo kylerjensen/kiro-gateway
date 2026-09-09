@@ -75,6 +75,9 @@ from kiro.config import (
     HIDDEN_FROM_LIST,
     FALLBACK_MODELS,
     VPN_PROXY_URL,
+    CA_BUNDLE_PATH,
+    TLS_VERIFY,
+    get_ssl_verify,
     ACCOUNT_SYSTEM,
     ACCOUNTS_CONFIG_FILE,
     ACCOUNTS_STATE_FILE,
@@ -203,6 +206,22 @@ if VPN_PROXY_URL:
     
     logger.info(f"Proxy configured: {proxy_url_with_scheme}")
     logger.debug(f"NO_PROXY: {os.environ['NO_PROXY']}")
+
+
+# ==================================================================================================
+# TLS / Custom CA Bundle Diagnostics
+# ==================================================================================================
+# httpx does NOT honor CA-bundle env vars by default (unlike curl/requests/aws-cli).
+# get_ssl_verify() builds the verify= value passed to every httpx.AsyncClient below.
+if not TLS_VERIFY:
+    logger.warning(
+        "TLS verification is DISABLED (KIRO_TLS_VERIFY=false). "
+        "Connections are INSECURE - use only for debugging."
+    )
+elif CA_BUNDLE_PATH:
+    logger.info(f"Custom CA bundle in use for TLS verification: {CA_BUNDLE_PATH}")
+else:
+    logger.debug("No custom CA bundle configured; using default certifi trust store.")
 
 
 # --- Configuration Validation ---
@@ -351,7 +370,8 @@ async def lifespan(app: FastAPI):
     app.state.http_client = httpx.AsyncClient(
         limits=limits,
         timeout=timeout,
-        follow_redirects=True
+        follow_redirects=True,
+        verify=get_ssl_verify()
     )
     logger.info("Shared HTTP client created with connection pooling")
     
