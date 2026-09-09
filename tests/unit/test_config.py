@@ -969,3 +969,265 @@ class TestAccountSystemConfig:
         
         print(f"Comparing STATE_SAVE_INTERVAL_SECONDS: Expected 10, Got {config_module.STATE_SAVE_INTERVAL_SECONDS}")
         assert config_module.STATE_SAVE_INTERVAL_SECONDS == 10
+
+
+# ==================================================================================================
+# Tests for TLS / Custom CA Bundle Configuration
+# ==================================================================================================
+
+import ssl
+import subprocess
+from importlib import reload
+
+
+def _make_self_signed_cert(dir_path) -> str:
+    """
+    Generate a valid self-signed certificate PEM file for use as a CA bundle
+    in tests. Uses the openssl CLI so we don't depend on the `cryptography`
+    package. Returns the path to the generated .pem file.
+
+    Skips the test if openssl is unavailable.
+    """
+    from pathlib import Path
+
+    cert_path = Path(dir_path) / "test-ca.pem"
+    key_path = Path(dir_path) / "test-ca.key"
+    try:
+        subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                "-nodes", "-keyout", str(key_path), "-out", str(cert_path),
+                "-days", "1", "-subj", "/CN=kiro-gateway-test-ca",
+            ],
+            check=True,
+            capture_output=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:  # pragma: no cover
+        pytest.skip(f"openssl not available to generate test cert: {e}")
+    return str(cert_path)
+
+
+class TestCaBundleResolution:
+    """Tests for _resolve_ca_bundle_path() env-var resolution logic."""
+
+    def _reload_config(self):
+        import kiro.config as config_module
+        reload(config_module)
+        return config_module
+
+    def test_no_ca_bundle_env_vars_returns_none(self, monkeypatch):
+        """
+        What it does: With no CA-bundle env vars set, resolution returns None.
+        Purpose: Ensure default (certifi) behavior when nothing is configured.
+        """
+        print("Setup: Clearing all CA-bundle env vars...")
+        for var in ("KIRO_CA_BUNDLE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+            monkeypatch.delenv(var, raising=False)
+
+        config_module = self._reload_config()
+        result = config_module._resolve_ca_bundle_path()
+        print(f"Comparing CA_BUNDLE_PATH: Expected None, Got {result!r}")
+        assert result is None
+        assert config_module.CA_BUNDLE_PATH is None
+
+    def test_resolves_kiro_ca_bundle(self, tmp_path, monkeypatch):
+        """
+        What it does: KIRO_CA_BUNDLE pointing at an existing file is resolved.
+        Purpose: Ensure the gateway-specific override is honored.
+        """
+        cert = _make_self_signed_cert(tmp_path)
+        print(f"Setup: KIRO_CA_BUNDLE={cert}")
+        for var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("KIRO_CA_BUNDLE", cert)
+
+        config_module = self._reload_config()
+        result = config_module._resolve_ca_bundle_path()
+        print(f"Comparing: Expected '{cert}', Got '{result}'")
+        assert result == cert
+
+    def test_priority_kiro_over_others(self, tmp_path, monkeypatch):
+        """
+        What it does: KIRO_CA_BUNDLE takes priority over SSL_CERT_FILE etc.
+        Purpose: Ensure documented priority order is respected.
+        """
+        primary = _make_self_signed_cert(tmp_path)
+        # Create a second distinct file for the lower-priority var
+        from pathlib import Path
+        secondary = Path(tmp_path) / "secondary.pem"
+        secondary.write_text(Path(primary).read_text())
+
+        print(f"Setup: KIRO_CA_BUNDLE={primary} (priority), SSL_CERT_FILE={secondary}")
+        monkeypatch.setenv("KIRO_CA_BUNDLE", primary)
+        monkeypatch.setenv("SSL_CERT_FILE", str(secondary))
+        monkeypatch.delenv("REQUESTS_CA_BUNDLE", raising=False)
+        monkeypatch.delenv("CURL_CA_BUNDLE", raising=False)
+
+        config_module = self._reload_config()
+        result = config_module._resolve_ca_bundle_path()
+        print(f"Comparing: Expected '{primary}', Got '{result}'")
+        assert result == primary
+
+    def test_falls_back_to_requests_ca_bundle(self, tmp_path, monkeypatch):
+        """
+        What it does: When only REQUESTS_CA_BUNDLE is set, it is used.
+        Purpose: Ensure requests-style env var is honored (common corporate setup).
+        """
+        cert = _make_self_signed_cert(tmp_path)
+        print(f"Setup: only REQUESTS_CA_BUNDLE={cert}")
+        for var in ("KIRO_CA_BUNDLE", "SSL_CERT_FILE", "CURL_CA_BUNDLE"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("REQUESTS_CA_BUNDLE", cert)
+
+        config_module = self._reload_config()
+        result = config_module._resolve_ca_bundle_path()
+        print(f"Comparing: Expected '{cert}', Got '{result}'")
+        assert result == cert
+
+    def test_nonexistent_path_is_ignored(self, monkeypatch):
+        """
+        What it does: A CA-bundle env var pointing at a missing file is ignored.
+        Purpose: Ensure we don't crash / mis-configure on a stale path.
+        """
+        print("Setup: KIRO_CA_BUNDLE=/nonexistent/path/ca.pem")
+        for var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("KIRO_CA_BUNDLE", "/nonexistent/path/ca.pem")
+
+        config_module = self._reload_config()
+        result = config_module._resolve_ca_bundle_path()
+        print(f"Comparing: Expected None, Got {result!r}")
+        assert result is None
+
+
+class TestGetSslVerify:
+    """Tests for get_ssl_verify() - the value passed to httpx verify=."""
+
+    def _reload_config(self):
+        import kiro.config as config_module
+        reload(config_module)
+        return config_module
+
+    def test_default_returns_true(self, monkeypatch):
+        """
+        What it does: With no CA bundle and verify enabled, returns True.
+        Purpose: Ensure default secure behavior (verify against certifi).
+        """
+        print("Setup: no CA-bundle vars, KIRO_TLS_VERIFY unset...")
+        for var in ("KIRO_CA_BUNDLE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.delenv("KIRO_TLS_VERIFY", raising=False)
+
+        config_module = self._reload_config()
+        result = config_module.get_ssl_verify()
+        print(f"Comparing: Expected True, Got {result!r}")
+        assert result is True
+
+    def test_verify_disabled_returns_false(self, monkeypatch):
+        """
+        What it does: KIRO_TLS_VERIFY=false makes get_ssl_verify() return False.
+        Purpose: Ensure the (insecure) escape hatch works and takes priority.
+        """
+        print("Setup: KIRO_TLS_VERIFY=false...")
+        monkeypatch.setenv("KIRO_TLS_VERIFY", "false")
+        # Even with a bundle set, disabling verification wins.
+        monkeypatch.delenv("KIRO_CA_BUNDLE", raising=False)
+
+        config_module = self._reload_config()
+        assert config_module.TLS_VERIFY is False
+        result = config_module.get_ssl_verify()
+        print(f"Comparing: Expected False, Got {result!r}")
+        assert result is False
+
+    def test_custom_bundle_returns_ssl_context(self, tmp_path, monkeypatch):
+        """
+        What it does: A valid custom CA bundle yields an ssl.SSLContext that
+                      trusts that CA (plus the system defaults).
+        Purpose: This is the core corporate-VPN fix - httpx must receive an
+                 SSLContext loaded with the corporate CA.
+        """
+        cert = _make_self_signed_cert(tmp_path)
+        print(f"Setup: KIRO_CA_BUNDLE={cert}, verify enabled...")
+        monkeypatch.setenv("KIRO_CA_BUNDLE", cert)
+        monkeypatch.delenv("KIRO_TLS_VERIFY", raising=False)
+
+        config_module = self._reload_config()
+        result = config_module.get_ssl_verify()
+        print(f"Result type: {type(result)}")
+        assert isinstance(result, ssl.SSLContext)
+
+        # The context should trust our custom CA. Verify the cert subject is
+        # present among the loaded CA certs.
+        loaded_subjects = [
+            dict(x for rdn in c["subject"] for x in rdn).get("commonName")
+            for c in result.get_ca_certs()
+        ]
+        print(f"Loaded CA common names include our test CA: "
+              f"{'kiro-gateway-test-ca' in loaded_subjects}")
+        assert "kiro-gateway-test-ca" in loaded_subjects
+
+    def test_custom_bundle_relaxes_x509_strict(self, tmp_path, monkeypatch):
+        """
+        What it does: The SSLContext for a custom bundle has VERIFY_X509_STRICT
+                      cleared (corporate CAs often lack the AKI extension).
+        Purpose: This is what actually makes TLS-interception CAs verify under
+                 Python 3.13+ which enables strict mode by default.
+        """
+        import ssl as _ssl
+        if not hasattr(_ssl, "VERIFY_X509_STRICT"):
+            pytest.skip("VERIFY_X509_STRICT not available in this Python")
+
+        cert = _make_self_signed_cert(tmp_path)
+        print(f"Setup: KIRO_CA_BUNDLE={cert}...")
+        monkeypatch.setenv("KIRO_CA_BUNDLE", cert)
+        monkeypatch.delenv("KIRO_TLS_VERIFY", raising=False)
+
+        config_module = self._reload_config()
+        ctx = config_module.get_ssl_verify()
+        strict_set = bool(ctx.verify_flags & _ssl.VERIFY_X509_STRICT)
+        print(f"VERIFY_X509_STRICT still set on custom-bundle ctx: {strict_set}")
+        assert strict_set is False
+
+    def test_verify_disabled_priority_over_bundle(self, tmp_path, monkeypatch):
+        """
+        What it does: KIRO_TLS_VERIFY=false wins even if a valid bundle exists.
+        Purpose: Ensure the disable switch is unconditional.
+        """
+        cert = _make_self_signed_cert(tmp_path)
+        print(f"Setup: KIRO_CA_BUNDLE={cert} AND KIRO_TLS_VERIFY=false...")
+        monkeypatch.setenv("KIRO_CA_BUNDLE", cert)
+        monkeypatch.setenv("KIRO_TLS_VERIFY", "false")
+
+        config_module = self._reload_config()
+        result = config_module.get_ssl_verify()
+        print(f"Comparing: Expected False, Got {result!r}")
+        assert result is False
+
+
+class TestTlsVerifyFlag:
+    """Tests for the TLS_VERIFY boolean flag parsing."""
+
+    def _reload_config(self):
+        import kiro.config as config_module
+        reload(config_module)
+        return config_module
+
+    def test_default_true(self, monkeypatch):
+        print("Setup: KIRO_TLS_VERIFY unset...")
+        monkeypatch.delenv("KIRO_TLS_VERIFY", raising=False)
+        config_module = self._reload_config()
+        assert config_module.TLS_VERIFY is True
+
+    @pytest.mark.parametrize("value", ["false", "0", "no", "off", "FALSE", "Off"])
+    def test_falsey_values_disable(self, value, monkeypatch):
+        print(f"Setup: KIRO_TLS_VERIFY={value}...")
+        monkeypatch.setenv("KIRO_TLS_VERIFY", value)
+        config_module = self._reload_config()
+        assert config_module.TLS_VERIFY is False
+
+    @pytest.mark.parametrize("value", ["true", "1", "yes", "on", "anything-else"])
+    def test_truthy_values_enable(self, value, monkeypatch):
+        print(f"Setup: KIRO_TLS_VERIFY={value}...")
+        monkeypatch.setenv("KIRO_TLS_VERIFY", value)
+        config_module = self._reload_config()
+        assert config_module.TLS_VERIFY is True

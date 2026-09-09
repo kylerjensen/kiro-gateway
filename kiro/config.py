@@ -121,6 +121,119 @@ PROXY_API_KEY: str = os.getenv("PROXY_API_KEY", "my-super-secret-password-123")
 VPN_PROXY_URL: str = os.getenv("VPN_PROXY_URL", "")
 
 # ==================================================================================================
+# TLS / Custom CA Bundle Settings
+# ==================================================================================================
+
+# Custom CA bundle for TLS verification.
+#
+# WHY THIS EXISTS:
+#   Unlike `curl` (CURL_CA_BUNDLE), the `requests` library (REQUESTS_CA_BUNDLE),
+#   and the AWS CLI (AWS_CA_BUNDLE), the `httpx` library does NOT automatically
+#   honor CA-bundle environment variables. By default httpx verifies against the
+#   bundled `certifi` trust store, which does not contain private/corporate CAs.
+#
+#   On networks that perform TLS interception (corporate VPNs, forward proxies,
+#   Zscaler, Netskope, etc.) the server certificate is re-signed by a private
+#   corporate root CA. Verifying that chain against `certifi` fails with:
+#     [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed
+#
+#   To make httpx trust the corporate CA we must explicitly point it at the
+#   bundle. This value is resolved (in priority order) from:
+#     1. KIRO_CA_BUNDLE      (gateway-specific, highest priority)
+#     2. SSL_CERT_FILE       (OpenSSL / Python standard)
+#     3. REQUESTS_CA_BUNDLE  (requests library)
+#     4. CURL_CA_BUNDLE      (curl)
+#
+#   Set KIRO_CA_BUNDLE="" (explicitly empty) is treated as "not set". To force
+#   disabling verification entirely (NOT recommended) set KIRO_TLS_VERIFY=false.
+_CA_BUNDLE_ENV_VARS = ("KIRO_CA_BUNDLE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
+
+
+def _resolve_ca_bundle_path() -> Optional[str]:
+    """
+    Resolve the custom CA bundle path from environment variables.
+
+    Checks KIRO_CA_BUNDLE, SSL_CERT_FILE, REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE
+    in priority order and returns the first one that points at an existing file.
+
+    Returns:
+        Absolute path to the CA bundle file, or None if none is configured
+        or the configured path does not exist.
+    """
+    for var_name in _CA_BUNDLE_ENV_VARS:
+        raw = os.getenv(var_name)
+        if not raw:
+            continue
+        candidate = Path(raw).expanduser()
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+# Resolved CA bundle path (or None). Exposed for logging/diagnostics.
+CA_BUNDLE_PATH: Optional[str] = _resolve_ca_bundle_path()
+
+# Whether to verify TLS at all. Defaults to True (secure).
+# Set KIRO_TLS_VERIFY=false to disable verification entirely (INSECURE, last resort).
+TLS_VERIFY: bool = os.getenv("KIRO_TLS_VERIFY", "true").lower() not in ("false", "0", "no", "off")
+
+
+def get_ssl_verify():
+    """
+    Build the value to pass as httpx's ``verify=`` argument.
+
+    Resolution order:
+      1. If TLS verification is explicitly disabled -> return False (INSECURE).
+      2. If a custom CA bundle is configured and exists -> return an
+         ``ssl.SSLContext`` loaded with the system defaults PLUS that bundle,
+         with ``VERIFY_X509_STRICT`` relaxed so corporate CAs missing the
+         Authority Key Identifier extension still verify. Using a context
+         (rather than a bare path string) lets us keep the default trust store
+         AND add the corporate CA, so both public and intercepted endpoints
+         verify correctly.
+      3. Otherwise -> return True (httpx default: verify against certifi).
+
+    Returns:
+        bool | ssl.SSLContext suitable for httpx.AsyncClient(verify=...).
+    """
+    if not TLS_VERIFY:
+        return False
+
+    ca_path = CA_BUNDLE_PATH
+    if ca_path:
+        import ssl
+
+        ctx = ssl.create_default_context()
+
+        # Python 3.13+ enables VERIFY_X509_STRICT in the default context, which
+        # enforces RFC 5280 rules such as requiring the Authority Key Identifier
+        # (AKI) extension on CA certificates. Many corporate TLS-interception
+        # CAs (Zscaler, Netskope, Palo Alto, in-house "Forward TRUST" CAs, etc.)
+        # omit AKI, so strict mode rejects them with:
+        #   [SSL: CERTIFICATE_VERIFY_FAILED] ... Missing Authority Key Identifier
+        # even though curl/openssl accept them. Since the admin has explicitly
+        # opted in to a custom CA bundle, relax strict mode for that path so the
+        # corporate chain verifies. The default (no custom bundle) path below is
+        # left fully strict.
+        if hasattr(ssl, "VERIFY_X509_STRICT"):
+            ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+
+        # Keep the default system/certifi roots and ADD the corporate bundle,
+        # so public endpoints (e.g. OIDC) and intercepted ones both verify.
+        try:
+            ctx.load_verify_locations(cafile=ca_path)
+        except (ssl.SSLError, OSError):
+            # If the bundle can't be loaded, fall back to loading it as the
+            # sole trust source rather than silently trusting nothing.
+            ctx = ssl.create_default_context(cafile=ca_path)
+            if hasattr(ssl, "VERIFY_X509_STRICT"):
+                ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+        return ctx
+
+    return True
+
+
+# ==================================================================================================
 # Kiro API Credentials
 # ==================================================================================================
 
